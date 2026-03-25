@@ -1,333 +1,414 @@
-#Requires -Version 5.1
+#Requires -RunAsAdministrator
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
+    [ValidateSet('Apply', 'Restore')]
+    [string]$Action
+)
 
-[CmdletBinding()]
-param()
-
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-function Write-Info($msg)    { Write-Host "[信息] $msg" -ForegroundColor Cyan }
-function Write-Ok($msg)      { Write-Host "[完成] $msg" -ForegroundColor Green }
-function Write-WarnMsg($msg) { Write-Host "[警告] $msg" -ForegroundColor Yellow }
-function Write-Skip($msg)    { Write-Host "[跳过] $msg" -ForegroundColor DarkYellow }
-function Write-Err($msg)     { Write-Host "[错误] $msg" -ForegroundColor Red }
+$HighPerformanceSchemeGuid = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+$BalancedSchemeGuid = '381b4222-f694-41f0-9685-ff5bb260df2e'
+$ProcessorSubgroupGuid = '54533251-82be-4824-96c1-47b60b740d00'
+$SleepSubgroupGuid = '238c9fa8-0aad-41ed-83f4-97be242c8f20'
+$StandbyIdleGuid = '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'
+$HybridSleepGuid = '94ac6d29-73ce-41a6-809f-6363ba21b47e'
+$HibernateIdleGuid = '9d7815a6-7ee4-497e-8888-515a05f02364'
 
-function Get-ExecutionPaths {
-    $outputDir = (Get-Location).Path
-    $launchFile = $null
-
-    if ($PSCommandPath) {
-        $launchFile = $PSCommandPath
-        $outputDir = Split-Path -Parent $PSCommandPath
-    }
-    elseif ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.ScriptBlock) {
-        $selfText = $MyInvocation.MyCommand.ScriptBlock.ToString()
-        if ($selfText) {
-            $launchFile = Join-Path $env:TEMP 'cpu-high-performance.ps1'
-            Set-Content -LiteralPath $launchFile -Value $selfText -Encoding UTF8 -Force
-        }
-    }
-
-    [pscustomobject]@{
-        LaunchFile = $launchFile
-        OutputDir  = $outputDir
+function Assert-Administrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Please run this script from an elevated PowerShell session.'
     }
 }
 
-$script:Paths = Get-ExecutionPaths
+function Invoke-PowerCfgQuery {
+    param([Parameter(Mandatory)][string[]]$Arguments)
 
-function Test-Admin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p  = New-Object Security.Principal.WindowsPrincipal($id)
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Restart-Elevated {
-    if (-not $script:Paths.LaunchFile) {
-        throw "无法确定脚本路径。请改用先下载再执行的方式运行此脚本。"
+    $output = & powercfg.exe @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "powercfg.exe $($Arguments -join ' ') failed with exit code $LASTEXITCODE. $(($output | Out-String).Trim())"
     }
 
-    $argList = @(
-        '-NoProfile'
-        '-ExecutionPolicy', 'Bypass'
-        '-File', "`"$($script:Paths.LaunchFile)`""
-    )
-
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
-    exit
+    return ($output | Out-String)
 }
 
-function Get-OsInfo {
-    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-    [pscustomobject]@{
-        ProductName        = $cv.ProductName
-        CurrentVersion     = $cv.CurrentVersion
-        CurrentBuildNumber = [int]$cv.CurrentBuildNumber
-        DisplayVersion     = $cv.DisplayVersion
-    }
-}
-
-function Invoke-PowerCfg {
+function Invoke-PowerCfgChange {
     param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Arguments,
-        [switch]$IgnoreError
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string[]]$Arguments
     )
 
-    $output = & powercfg @Arguments 2>&1
-    $code = $LASTEXITCODE
-
-    if (-not $IgnoreError -and $code -ne 0) {
-        throw "powercfg 执行失败: powercfg $($Arguments -join ' ')`n$output"
+    if (-not $PSCmdlet.ShouldProcess($Target, $Action)) {
+        return
     }
 
-    [pscustomobject]@{
-        ExitCode = $code
-        Output   = ($output | Out-String).Trim()
+    $output = & powercfg.exe @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "powercfg.exe $($Arguments -join ' ') failed with exit code $LASTEXITCODE. $(($output | Out-String).Trim())"
     }
 }
 
-function Find-GuidInLinesByNames {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Lines,
+function New-UnicodeString {
+    param([Parameter(Mandatory)][int[]]$CodePoints)
 
-        [Parameter(Mandatory = $true)]
-        [string[]]$CandidateNames
-    )
+    return -join ($CodePoints | ForEach-Object { [char]$_ })
+}
 
-    $guidPattern = '(?i)\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b'
+function Get-StateInfo {
+    $commonApplicationData = [Environment]::GetFolderPath('CommonApplicationData')
+    if ([string]::IsNullOrWhiteSpace($commonApplicationData)) {
+        $commonApplicationData = $env:ProgramData
+    }
+    if ([string]::IsNullOrWhiteSpace($commonApplicationData)) {
+        $commonApplicationData = $env:LOCALAPPDATA
+    }
+    if ([string]::IsNullOrWhiteSpace($commonApplicationData)) {
+        throw 'Unable to resolve a stable directory for the backup state file.'
+    }
 
-    for ($i = 0; $i -lt $Lines.Count; $i++) {
-        $line = [string]$Lines[$i]
-        $matchedName = $false
+    $stateDirectory = Join-Path -Path $commonApplicationData -ChildPath 'CpuHighPerformance'
+    $stateFilePath = Join-Path -Path $stateDirectory -ChildPath 'state.json'
+    $legacyStateFiles = @()
 
-        foreach ($name in $CandidateNames) {
-            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $legacyStateFiles += Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath '.powercfg-backup') -ChildPath 'state.json'
+    }
 
-            if ($line.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $matchedName = $true
-                break
-            }
-        }
+    return [ordered]@{
+        StateDirectory = $stateDirectory
+        StateFilePath = $stateFilePath
+        LegacyStateFiles = $legacyStateFiles | Select-Object -Unique
+    }
+}
 
-        if (-not $matchedName) { continue }
+function Get-ExistingStateFilePath {
+    param([Parameter(Mandatory)][hashtable]$StateInfo)
 
-        $m = [regex]::Match($line, $guidPattern)
-        if ($m.Success) {
-            return $m.Value.ToLowerInvariant()
-        }
+    if (Test-Path -Path $StateInfo.StateFilePath) {
+        return $StateInfo.StateFilePath
+    }
 
-        $start = [Math]::Max(0, $i - 3)
-        $end   = [Math]::Min($Lines.Count - 1, $i + 3)
-
-        for ($j = $start; $j -le $end; $j++) {
-            $nearLine = [string]$Lines[$j]
-            $nearMatch = [regex]::Match($nearLine, $guidPattern)
-            if ($nearMatch.Success) {
-                return $nearMatch.Value.ToLowerInvariant()
-            }
+    foreach ($candidate in $StateInfo.LegacyStateFiles) {
+        if (Test-Path -Path $candidate) {
+            return $candidate
         }
     }
 
     return $null
 }
 
-try {
-    if (-not (Test-Admin)) {
-        Write-Info "当前未以管理员身份运行，正在请求提权..."
-        Restart-Elevated
+function Remove-StateArtifacts {
+    param([Parameter(Mandatory)][string]$StateFilePath)
+
+    if (Test-Path -Path $StateFilePath) {
+        Remove-Item -Path $StateFilePath -Force
     }
 
-    $os = Get-OsInfo
-
-    Write-Info "Windows Product : $($os.ProductName)"
-    Write-Info "Windows Version : $($os.CurrentVersion)"
-    Write-Info "Windows Build   : $($os.CurrentBuildNumber)"
-    if ($os.DisplayVersion) {
-        Write-Info "Display Version : $($os.DisplayVersion)"
+    $stateDirectory = Split-Path -Path $StateFilePath -Parent
+    if ((Test-Path -Path $stateDirectory) -and -not (Get-ChildItem -Path $stateDirectory -Force | Select-Object -First 1)) {
+        Remove-Item -Path $stateDirectory -Force
     }
-    Write-Host ""
-
-    $isWin10 = $os.ProductName -like '*Windows 10*'
-    $isWin11 = $os.ProductName -like '*Windows 11*'
-
-    if (-not ($isWin10 -or $isWin11)) {
-        Write-Err "该脚本按 Windows 10 / 11 桌面版设计，当前系统不在支持范围内。"
-        exit 1
-    }
-
-    $supportPowerThrottling = $os.CurrentBuildNumber -ge 16299
-
-    Write-Info "步骤 1/7：检查关闭电源节流支持情况"
-    if ($supportPowerThrottling) {
-        New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -Force | Out-Null
-        New-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' `
-            -Name 'PowerThrottlingOff' `
-            -PropertyType DWord `
-            -Value 1 `
-            -Force | Out-Null
-        Write-Ok "已写入 PowerThrottlingOff=1"
-    }
-    else {
-        Write-Skip "当前系统版本过低，不支持该设置。需要 Windows 10 1709 / Build 16299 或更高版本。"
-    }
-
-    Write-Host ""
-    Write-Info "步骤 2/7：恢复默认电源方案"
-    try {
-        Invoke-PowerCfg -Arguments @('/restoredefaultschemes') | Out-Null
-        Write-Ok "已恢复默认电源方案"
-    }
-    catch {
-        Write-WarnMsg $_.Exception.Message
-    }
-
-    Write-Host ""
-    Write-Info "步骤 3/7：切换到高性能电源方案"
-    try {
-        Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_MIN') | Out-Null
-        Write-Ok "当前已切换到高性能"
-    }
-    catch {
-        Write-WarnMsg "切换到高性能电源方案失败，继续执行后续步骤。"
-    }
-
-    Write-Host ""
-    Write-Info "步骤 4/7：导出当前处理器电源设置到 a.txt"
-    $txtPath = Join-Path $script:Paths.OutputDir 'a.txt'
-    try {
-        $q1 = Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR')
-        $q2 = Invoke-PowerCfg -Arguments @('/qh')
-
-        @(
-            $q1.Output
-            ""
-            "===================="
-            "FULL HIDDEN SETTINGS"
-            "===================="
-            ""
-            $q2.Output
-        ) | Set-Content -LiteralPath $txtPath -Encoding UTF8
-
-        Write-Ok "已生成 $txtPath"
-    }
-    catch {
-        Write-WarnMsg "导出电源设置失败：$($_.Exception.Message)"
-    }
-
-    Write-Host ""
-    Write-Info "步骤 5/7：从 a.txt 中搜索对应 GUID"
-
-    $lines = Get-Content -LiteralPath $txtPath -ErrorAction Stop
-
-    $processorSubgroupGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
-        'Processor power management',
-        '处理器电源管理'
-    )
-
-    $schedPolicyGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
-        'Heterogeneous thread scheduling policy',
-        '异类线程调度策略'
-    )
-
-    $shortSchedPolicyGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
-        'Heterogeneous short running thread scheduling policy',
-        '异类短运行线程调度策略'
-    )
-
-    if ($processorSubgroupGuid) {
-        Write-Ok "已从 a.txt 识别处理器子组 GUID: $processorSubgroupGuid"
-    }
-    else {
-        Write-WarnMsg "未能从 a.txt 识别处理器电源管理子组 GUID"
-    }
-
-    if ($schedPolicyGuid) {
-        Write-Ok "已从 a.txt 识别异类线程调度策略 GUID: $schedPolicyGuid"
-    }
-    else {
-        Write-WarnMsg "未能从 a.txt 识别异类线程调度策略 GUID"
-    }
-
-    if ($shortSchedPolicyGuid) {
-        Write-Ok "已从 a.txt 识别异类短运行线程调度策略 GUID: $shortSchedPolicyGuid"
-    }
-    else {
-        Write-WarnMsg "未能从 a.txt 识别异类短运行线程调度策略 GUID"
-    }
-
-    Write-Host ""
-    Write-Info "步骤 6/7：取消隐藏对应电源选项"
-
-    if ($processorSubgroupGuid -and $schedPolicyGuid) {
-        Invoke-PowerCfg -Arguments @('-attributes', $processorSubgroupGuid, $schedPolicyGuid, '-ATTRIB_HIDE') -IgnoreError | Out-Null
-        Write-Ok "已取消隐藏异类线程调度策略"
-    }
-    else {
-        Write-Skip "由于未找到对应 GUID，跳过取消隐藏异类线程调度策略"
-    }
-
-    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
-        Invoke-PowerCfg -Arguments @('-attributes', $processorSubgroupGuid, $shortSchedPolicyGuid, '-ATTRIB_HIDE') -IgnoreError | Out-Null
-        Write-Ok "已取消隐藏异类短运行线程调度策略"
-    }
-    else {
-        Write-Skip "由于未找到对应 GUID，跳过取消隐藏异类短运行线程调度策略"
-    }
-
-    Write-Host ""
-    Write-Info "步骤 7/7：写入高性能相关设置"
-
-    if ($processorSubgroupGuid -and $schedPolicyGuid) {
-        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid, '2') | Out-Null
-        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid, '2') | Out-Null
-        Write-Ok "异类线程调度策略已设置为首选高性能处理器"
-    }
-    else {
-        Write-Skip "由于未找到对应 GUID，跳过设置异类线程调度策略"
-    }
-
-    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
-        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid, '2') | Out-Null
-        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid, '2') | Out-Null
-        Write-Ok "异类短运行线程调度策略已设置为首选高性能处理器"
-    }
-    else {
-        Write-Skip "由于未找到对应 GUID，跳过设置异类短运行线程调度策略"
-    }
-
-    Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_CURRENT') -IgnoreError | Out-Null
-
-    Write-Host ""
-    Write-Host "---------- 当前状态 ----------"
-
-    try {
-        $reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -ErrorAction Stop
-        Write-Host "PowerThrottlingOff = $($reg.PowerThrottlingOff)"
-    }
-    catch {
-        Write-WarnMsg "无法读取 PowerThrottlingOff"
-    }
-
-    if ($processorSubgroupGuid -and $schedPolicyGuid) {
-        Write-Host "---------- SCHED POLICY ----------"
-        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid)).Output | Write-Host
-    }
-
-    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
-        Write-Host "---------- SHORT SCHED POLICY ----------"
-        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid)).Output | Write-Host
-    }
-
-    Write-Host ""
-    Write-Host "[说明] 关闭电源节流仅适用于 Windows 10 1709+ / Windows 11"
-    Write-Host "[说明] 首选高性能处理器 对应值为 2"
-    Write-Host "[说明] 本脚本按你的要求，从 a.txt 中搜索名称并提取对应 GUID"
-    Write-Host "[说明] 如果你的系统翻译不同，请调整脚本中的 CandidateNames"
-    Write-Host "[说明] 建议执行后重启一次系统"
 }
-catch {
-    Write-Err $_.Exception.Message
-    exit 1
+
+function Get-FirstGuidFromText {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $match = [regex]::Match($Text, '[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}')
+    if (-not $match.Success) {
+        throw 'Unable to find a GUID in powercfg output.'
+    }
+
+    return $match.Value.ToLowerInvariant()
+}
+
+function Convert-HexIndexToDecimal {
+    param([Parameter(Mandatory)][string]$Value)
+
+    return [int][Convert]::ToUInt32($Value.Replace('0x', ''), 16)
+}
+
+function Get-IndexValueFromLines {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Mandatory)][string[]]$Markers
+    )
+
+    foreach ($line in $Lines) {
+        foreach ($marker in $Markers) {
+            if ($line -like "*$marker*") {
+                $match = [regex]::Match($line, '0x[0-9A-Fa-f]+')
+                if ($match.Success) {
+                    return Convert-HexIndexToDecimal -Value $match.Value
+                }
+            }
+        }
+    }
+
+    throw 'Unable to extract a power setting index from powercfg output.'
+}
+
+function Get-SettingValuePair {
+    param(
+        [Parameter(Mandatory)][string]$SchemeGuid,
+        [Parameter(Mandatory)][string]$SubgroupGuid,
+        [Parameter(Mandatory)][string]$SettingGuid
+    )
+
+    $text = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid, $SettingGuid)
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "powercfg /q returned no output for scheme '$SchemeGuid', subgroup '$SubgroupGuid', setting '$SettingGuid'."
+    }
+
+    $lines = ($text -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $currentAcMarkerZh = New-UnicodeString -CodePoints @(0x5F53,0x524D,0x4EA4,0x6D41,0x7535,0x6E90,0x8BBE,0x7F6E,0x7D22,0x5F15)
+    $currentDcMarkerZh = New-UnicodeString -CodePoints @(0x5F53,0x524D,0x76F4,0x6D41,0x7535,0x6E90,0x8BBE,0x7F6E,0x7D22,0x5F15)
+
+    return [ordered]@{
+        Ac = Get-IndexValueFromLines -Lines $lines -Markers @('Current AC Power Setting Index', $currentAcMarkerZh)
+        Dc = Get-IndexValueFromLines -Lines $lines -Markers @('Current DC Power Setting Index', $currentDcMarkerZh)
+    }
+}
+
+function Get-HeterogeneousDisplayNames {
+    return [ordered]@{
+        Thread = @(
+            (New-UnicodeString -CodePoints @(0x5F02,0x7C7B,0x7EBF,0x7A0B,0x8C03,0x5EA6,0x7B56,0x7565)),
+            'Heterogeneous thread scheduling policy'
+        )
+        ShortThread = @(
+            (New-UnicodeString -CodePoints @(0x5F02,0x7C7B,0x77ED,0x8FD0,0x884C,0x7EBF,0x7A0B,0x8C03,0x5EA6,0x7B56,0x7565)),
+            'Heterogeneous short running thread scheduling policy'
+        )
+    }
+}
+
+function Resolve-HeterogeneousSetting {
+    param(
+        [Parameter(Mandatory)][string]$QueryText,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string[]]$LocalizedDisplayNames,
+        [Parameter(Mandatory)][string]$Alias
+    )
+
+    $guidPattern = '[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}'
+    $lines = $QueryText -split "`r?`n"
+
+    foreach ($displayName in $LocalizedDisplayNames) {
+        foreach ($line in $lines) {
+            if ($line -like "*$displayName*") {
+                $match = [regex]::Match($line, $guidPattern)
+                if ($match.Success) {
+                    return [ordered]@{
+                        Name = $Name
+                        Guid = $match.Value.ToLowerInvariant()
+                        MatchedBy = 'display-name'
+                        MatchedValue = $displayName
+                    }
+                }
+            }
+        }
+    }
+
+    for ($index = 0; $index -lt $lines.Length; $index++) {
+        if ($lines[$index] -match ('(GUID 别名|GUID Alias)\s*[:：]\s*' + [regex]::Escape($Alias) + '\b')) {
+            for ($lookup = $index - 1; $lookup -ge [Math]::Max(0, $index - 4); $lookup--) {
+                $match = [regex]::Match($lines[$lookup], $guidPattern)
+                if ($match.Success) {
+                    return [ordered]@{
+                        Name = $Name
+                        Guid = $match.Value.ToLowerInvariant()
+                        MatchedBy = 'alias'
+                        MatchedValue = $Alias
+                    }
+                }
+            }
+        }
+    }
+
+    throw "Unable to find the GUID for '$Name'."
+}
+
+function Get-ExistingSchemeGuids {
+    $text = Invoke-PowerCfgQuery -Arguments @('/list')
+    return [regex]::Matches($text, '[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}') |
+        ForEach-Object { $_.Value.ToLowerInvariant() } |
+        Select-Object -Unique
+}
+
+function Invoke-ApplyMode {
+    param([Parameter(Mandatory)][hashtable]$StateInfo)
+
+    $existingSchemes = Get-ExistingSchemeGuids
+    if ($existingSchemes -notcontains $HighPerformanceSchemeGuid) {
+        throw "The built-in High performance scheme ($HighPerformanceSchemeGuid) is not available on this machine."
+    }
+
+    $processorQueryText = Invoke-PowerCfgQuery -Arguments @('/qh', 'SCHEME_CURRENT', 'SUB_PROCESSOR')
+    $currentActiveSchemeGuid = Get-FirstGuidFromText -Text (Invoke-PowerCfgQuery -Arguments @('/getactivescheme'))
+    $displayNames = Get-HeterogeneousDisplayNames
+
+    $heterogeneousThreadSchedulingSetting = Resolve-HeterogeneousSetting -QueryText $processorQueryText -Name 'HeterogeneousThreadSchedulingPolicy' -LocalizedDisplayNames $displayNames.Thread -Alias 'SCHEDPOLICY'
+    $heterogeneousShortRunningThreadSchedulingSetting = Resolve-HeterogeneousSetting -QueryText $processorQueryText -Name 'HeterogeneousShortRunningThreadSchedulingPolicy' -LocalizedDisplayNames $displayNames.ShortThread -Alias 'SHORTSCHEDPOLICY'
+    $heterogeneousSettings = @($heterogeneousThreadSchedulingSetting, $heterogeneousShortRunningThreadSchedulingSetting)
+
+    $state = [ordered]@{
+        CreatedAt = (Get-Date).ToString('o')
+        PreviousActiveSchemeGuid = $currentActiveSchemeGuid
+        TargetSchemeGuid = $HighPerformanceSchemeGuid
+        FallbackSchemeGuid = $BalancedSchemeGuid
+        SleepSettings = [ordered]@{
+            StandbyIdle = [ordered]@{
+                Guid = $StandbyIdleGuid
+                Values = Get-SettingValuePair -SchemeGuid $HighPerformanceSchemeGuid -SubgroupGuid $SleepSubgroupGuid -SettingGuid $StandbyIdleGuid
+            }
+            HybridSleep = [ordered]@{
+                Guid = $HybridSleepGuid
+                Values = Get-SettingValuePair -SchemeGuid $HighPerformanceSchemeGuid -SubgroupGuid $SleepSubgroupGuid -SettingGuid $HybridSleepGuid
+            }
+            HibernateIdle = [ordered]@{
+                Guid = $HibernateIdleGuid
+                Values = Get-SettingValuePair -SchemeGuid $HighPerformanceSchemeGuid -SubgroupGuid $SleepSubgroupGuid -SettingGuid $HibernateIdleGuid
+            }
+        }
+        HeterogeneousSettings = @(
+            foreach ($setting in $heterogeneousSettings) {
+                [ordered]@{
+                    Name = $setting.Name
+                    Guid = $setting.Guid
+                    MatchedBy = $setting.MatchedBy
+                    MatchedValue = $setting.MatchedValue
+                    Values = Get-SettingValuePair -SchemeGuid $HighPerformanceSchemeGuid -SubgroupGuid $ProcessorSubgroupGuid -SettingGuid $setting.Guid
+                }
+            }
+        )
+    }
+
+    if ($PSCmdlet.ShouldProcess($StateInfo.StateFilePath, 'Save current power plan backup state')) {
+        if (-not (Test-Path -Path $StateInfo.StateDirectory)) {
+            New-Item -Path $StateInfo.StateDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $state | ConvertTo-Json -Depth 8 | Set-Content -Path $StateInfo.StateFilePath -Encoding UTF8
+    }
+
+    Invoke-PowerCfgChange -Action 'Activate High performance power plan' -Target $HighPerformanceSchemeGuid -Arguments @('/setactive', $HighPerformanceSchemeGuid)
+    Invoke-PowerCfgChange -Action 'Disable AC sleep timeout' -Target 'SCHEME_CURRENT standby-timeout-ac' -Arguments @('/change', 'standby-timeout-ac', '0')
+    Invoke-PowerCfgChange -Action 'Disable DC sleep timeout' -Target 'SCHEME_CURRENT standby-timeout-dc' -Arguments @('/change', 'standby-timeout-dc', '0')
+    Invoke-PowerCfgChange -Action 'Disable AC hibernate timeout' -Target 'SCHEME_CURRENT hibernate-timeout-ac' -Arguments @('/change', 'hibernate-timeout-ac', '0')
+    Invoke-PowerCfgChange -Action 'Disable DC hibernate timeout' -Target 'SCHEME_CURRENT hibernate-timeout-dc' -Arguments @('/change', 'hibernate-timeout-dc', '0')
+    Invoke-PowerCfgChange -Action 'Disable AC hybrid sleep' -Target 'SCHEME_CURRENT HYBRIDSLEEP' -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_SLEEP', $HybridSleepGuid, '0')
+    Invoke-PowerCfgChange -Action 'Disable DC hybrid sleep' -Target 'SCHEME_CURRENT HYBRIDSLEEP' -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_SLEEP', $HybridSleepGuid, '0')
+
+    foreach ($setting in $heterogeneousSettings) {
+        Invoke-PowerCfgChange -Action 'Unhide processor scheduling setting' -Target $setting.Guid -Arguments @('-attributes', 'SUB_PROCESSOR', $setting.Guid, '-ATTRIB_HIDE')
+        Invoke-PowerCfgChange -Action 'Prefer performant processors on AC' -Target $setting.Guid -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', $setting.Guid, '2')
+    }
+
+    Invoke-PowerCfgChange -Action 'Re-apply the active power scheme' -Target 'SCHEME_CURRENT' -Arguments @('/setactive', 'SCHEME_CURRENT')
+
+    Write-Host "High performance configuration applied successfully."
+    Write-Host "Backup state saved to: $($StateInfo.StateFilePath)"
+    foreach ($setting in $heterogeneousSettings) {
+        Write-Host ("Resolved {0} => {1} [{2}={3}]" -f $setting.Name, $setting.Guid, $setting.MatchedBy, $setting.MatchedValue)
+    }
+}
+
+function Invoke-RestoreMode {
+    param([Parameter(Mandatory)][hashtable]$StateInfo)
+
+    $existingSchemes = Get-ExistingSchemeGuids
+    $stateFilePath = Get-ExistingStateFilePath -StateInfo $StateInfo
+
+    if ($stateFilePath) {
+        $state = Get-Content -Path $stateFilePath -Raw | ConvertFrom-Json
+
+        foreach ($sleepSettingName in @('StandbyIdle', 'HybridSleep', 'HibernateIdle')) {
+            $sleepSetting = $state.SleepSettings.$sleepSettingName
+            Invoke-PowerCfgChange -Action 'Restore AC sleep setting value' -Target $sleepSetting.Guid -Arguments @('/setacvalueindex', $state.TargetSchemeGuid, $SleepSubgroupGuid, $sleepSetting.Guid, [string]$sleepSetting.Values.Ac)
+            Invoke-PowerCfgChange -Action 'Restore DC sleep setting value' -Target $sleepSetting.Guid -Arguments @('/setdcvalueindex', $state.TargetSchemeGuid, $SleepSubgroupGuid, $sleepSetting.Guid, [string]$sleepSetting.Values.Dc)
+        }
+
+        foreach ($setting in $state.HeterogeneousSettings) {
+            Invoke-PowerCfgChange -Action 'Restore AC processor scheduling value' -Target $setting.Guid -Arguments @('/setacvalueindex', $state.TargetSchemeGuid, $ProcessorSubgroupGuid, $setting.Guid, [string]$setting.Values.Ac)
+            Invoke-PowerCfgChange -Action 'Restore DC processor scheduling value' -Target $setting.Guid -Arguments @('/setdcvalueindex', $state.TargetSchemeGuid, $ProcessorSubgroupGuid, $setting.Guid, [string]$setting.Values.Dc)
+            Invoke-PowerCfgChange -Action 'Hide processor scheduling setting again' -Target $setting.Guid -Arguments @('-attributes', 'SUB_PROCESSOR', $setting.Guid, '+ATTRIB_HIDE')
+        }
+
+        $restoreSchemeGuid = $BalancedSchemeGuid
+        if ($state.PreviousActiveSchemeGuid -and ($existingSchemes -contains $state.PreviousActiveSchemeGuid.ToLowerInvariant())) {
+            $restoreSchemeGuid = $state.PreviousActiveSchemeGuid
+        }
+        elseif ($state.FallbackSchemeGuid -and ($existingSchemes -contains $state.FallbackSchemeGuid.ToLowerInvariant())) {
+            $restoreSchemeGuid = $state.FallbackSchemeGuid
+        }
+        elseif ($existingSchemes -contains $HighPerformanceSchemeGuid) {
+            $restoreSchemeGuid = $HighPerformanceSchemeGuid
+        }
+
+        Invoke-PowerCfgChange -Action 'Activate restored power plan' -Target $restoreSchemeGuid -Arguments @('/setactive', $restoreSchemeGuid)
+
+        if ($PSCmdlet.ShouldProcess($stateFilePath, 'Delete backup state after successful restore')) {
+            Remove-StateArtifacts -StateFilePath $stateFilePath
+        }
+
+        Write-Host "Power settings restored from backup state successfully."
+        Write-Host "Re-activated scheme: $restoreSchemeGuid"
+        return
+    }
+
+    $displayNames = Get-HeterogeneousDisplayNames
+    $processorQueryText = Invoke-PowerCfgQuery -Arguments @('/qh', 'SCHEME_CURRENT', 'SUB_PROCESSOR')
+    $resolvedThreadSetting = Resolve-HeterogeneousSetting -QueryText $processorQueryText -Name 'HeterogeneousThreadSchedulingPolicy' -LocalizedDisplayNames $displayNames.Thread -Alias 'SCHEDPOLICY'
+    $resolvedShortThreadSetting = Resolve-HeterogeneousSetting -QueryText $processorQueryText -Name 'HeterogeneousShortRunningThreadSchedulingPolicy' -LocalizedDisplayNames $displayNames.ShortThread -Alias 'SHORTSCHEDPOLICY'
+
+    foreach ($setting in @($resolvedThreadSetting, $resolvedShortThreadSetting)) {
+        Invoke-PowerCfgChange -Action 'Hide processor scheduling setting again' -Target $setting.Guid -Arguments @('-attributes', 'SUB_PROCESSOR', $setting.Guid, '+ATTRIB_HIDE')
+    }
+
+    if ($existingSchemes -notcontains $BalancedSchemeGuid) {
+        throw "No backup state file was found and the built-in Balanced scheme ($BalancedSchemeGuid) is not available on this machine."
+    }
+
+    Invoke-PowerCfgChange -Action 'Activate Balanced power plan fallback' -Target $BalancedSchemeGuid -Arguments @('/setactive', $BalancedSchemeGuid)
+    Write-Warning "No backup state file was found. The script hid the exposed processor settings again and switched the active plan to Balanced."
+}
+
+function Read-DesiredAction {
+    while ($true) {
+        Write-Host ''
+        Write-Host '请选择操作 / Choose an action:'
+        Write-Host '  1) 启用高性能模式 / Apply high performance mode'
+        Write-Host '  2) 恢复默认设置 / Restore default settings'
+        Write-Host '  Q) 退出 / Exit'
+
+        $choice = (Read-Host '请输入 1 / 2 / Q').Trim()
+        switch -Regex ($choice) {
+            '^(1|a|apply)$' { return 'Apply' }
+            '^(2|r|restore)$' { return 'Restore' }
+            '^(q|quit|exit)$' { return $null }
+            default { Write-Warning '无效输入 / Invalid choice. Please try again.' }
+        }
+    }
+}
+
+Assert-Administrator
+$stateInfo = Get-StateInfo
+
+if (-not $Action) {
+    $Action = Read-DesiredAction
+    if (-not $Action) {
+        Write-Host 'Operation cancelled.'
+        return
+    }
+}
+
+switch ($Action) {
+    'Apply' { Invoke-ApplyMode -StateInfo $stateInfo }
+    'Restore' { Invoke-RestoreMode -StateInfo $stateInfo }
+    default { throw "Unsupported action '$Action'." }
 }
