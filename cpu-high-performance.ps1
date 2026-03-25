@@ -1,8 +1,8 @@
 #Requires -RunAsAdministrator
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [ValidateSet('Apply', 'Restore')]
-    [string]$Action
+    [Alias('Action')]
+    [string]$CpuHighPerformanceAction
 )
 
 Set-StrictMode -Version Latest
@@ -386,7 +386,12 @@ function Read-DesiredAction {
         Write-Host '  2) 恢复默认设置 / Restore default settings'
         Write-Host '  Q) 退出 / Exit'
 
-        $choice = (Read-Host '请输入 1 / 2 / Q').Trim()
+        $choiceInput = Read-Host '请输入 1 / 2 / Q'
+        if ($null -eq $choiceInput) {
+            return $null
+        }
+
+        $choice = $choiceInput.Trim()
         switch -Regex ($choice) {
             '^(1|a|apply)$' { return 'Apply' }
             '^(2|r|restore)$' { return 'Restore' }
@@ -396,19 +401,36 @@ function Read-DesiredAction {
     }
 }
 
+function Resolve-DesiredAction {
+    param([string]$RequestedAction)
+
+    if ([string]::IsNullOrWhiteSpace($RequestedAction)) {
+        return $null
+    }
+
+    switch -Regex ($RequestedAction.Trim()) {
+        '^(apply)$' { return 'Apply' }
+        '^(restore)$' { return 'Restore' }
+        default {
+            throw "Unsupported action '$RequestedAction'. Allowed values: Apply, Restore."
+        }
+    }
+}
+
 Assert-Administrator
 $stateInfo = Get-StateInfo
+$resolvedAction = Resolve-DesiredAction -RequestedAction $CpuHighPerformanceAction
 
-if (-not $Action) {
-    $Action = Read-DesiredAction
-    if (-not $Action) {
+if (-not $resolvedAction) {
+    $resolvedAction = Read-DesiredAction
+    if (-not $resolvedAction) {
         Write-Host 'Operation cancelled.'
         return
     }
 }
 
-switch ($Action) {
+switch ($resolvedAction) {
     'Apply' { Invoke-ApplyMode -StateInfo $stateInfo }
     'Restore' { Invoke-RestoreMode -StateInfo $stateInfo }
-    default { throw "Unsupported action '$Action'." }
+    default { throw "Unsupported action '$resolvedAction'." }
 }
