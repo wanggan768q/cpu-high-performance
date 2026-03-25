@@ -209,21 +209,41 @@ function Get-SettingBlockFromSubgroupText {
 
     $lines = $SubgroupText -split "`r?`n"
     $normalizedSettingGuid = $SettingGuid.ToLowerInvariant()
+    $guidPattern = '[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}'
     $capturedLines = New-Object System.Collections.Generic.List[string]
     $capturing = $false
+    $settingHeaderIndent = -1
 
     foreach ($line in $lines) {
         $lowerLine = $line.ToLowerInvariant()
 
-        if ($lowerLine -match '^[\s　]*(电源设置 guid|power setting guid)\s*[:：]') {
-            if ($capturing) {
-                break
-            }
+        # Detect setting-level headers: any line whose first GUID matches a known
+        # pattern and whose leading whitespace puts it at the setting indent level.
+        # This avoids dependence on locale-specific labels like "电源设置 GUID" or
+        # "Power Setting GUID".
+        $guidMatch = [regex]::Match($line, $guidPattern)
+        if ($guidMatch.Success) {
+            # Measure leading whitespace to distinguish setting headers from
+            # subgroup headers (which sit at a lower indent level).
+            $lineIndent = if ($line -match '^([\s　]+)') { $Matches[1].Length } else { 0 }
 
-            if ($lowerLine -like "*$normalizedSettingGuid*") {
-                $capturing = $true
-                $capturedLines.Add($line)
-                continue
+            # Heuristic: setting headers in powercfg output are indented more than
+            # subgroup headers.  Once we know the indent of the target header we
+            # use it to detect the *next* setting header and stop capturing.
+            $isSettingHeader = ($lineIndent -ge 2)
+
+            if ($isSettingHeader) {
+                if ($capturing) {
+                    # We hit the next setting block — stop.
+                    break
+                }
+
+                if ($lowerLine.Contains($normalizedSettingGuid)) {
+                    $capturing = $true
+                    $settingHeaderIndent = $lineIndent
+                    $capturedLines.Add($line)
+                    continue
+                }
             }
         }
 
@@ -246,14 +266,14 @@ function Get-SettingQueryText {
         [Parameter(Mandatory)][string]$SettingGuid
     )
 
-    $settingText = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid, $SettingGuid)
+    $settingText = Invoke-PowerCfgQuery -Arguments @('/qh', $SchemeGuid, $SubgroupGuid, $SettingGuid)
     if (-not [string]::IsNullOrWhiteSpace($settingText) -and $settingText.ToLowerInvariant().Contains($SettingGuid.ToLowerInvariant())) {
         return $settingText
     }
 
-    $subgroupText = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid)
+    $subgroupText = Invoke-PowerCfgQuery -Arguments @('/qh', $SchemeGuid, $SubgroupGuid)
     if ([string]::IsNullOrWhiteSpace($subgroupText)) {
-        throw "powercfg /q returned no output for scheme '$SchemeGuid' and subgroup '$SubgroupGuid'."
+        throw "powercfg /qh returned no output for scheme '$SchemeGuid' and subgroup '$SubgroupGuid'."
     }
 
     return Get-SettingBlockFromSubgroupText -SubgroupText $subgroupText -SettingGuid $SettingGuid
@@ -268,7 +288,7 @@ function Get-SettingValuePair {
 
     $text = Get-SettingQueryText -SchemeGuid $SchemeGuid -SubgroupGuid $SubgroupGuid -SettingGuid $SettingGuid
     if ([string]::IsNullOrWhiteSpace($text)) {
-        throw "powercfg /q returned no output for scheme '$SchemeGuid', subgroup '$SubgroupGuid', setting '$SettingGuid'."
+        throw "powercfg /qh returned no output for scheme '$SchemeGuid', subgroup '$SubgroupGuid', setting '$SettingGuid'."
     }
 
     return Get-CurrentIndicesFromText -Text $text
