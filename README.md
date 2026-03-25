@@ -24,6 +24,9 @@ The main script is designed for this usage pattern:
 
 ```powershell
 irm https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/heads/main/cpu-high-performance.ps1 | iex
+
+加速地址
+irm https://githubproxy.cc/https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/heads/main/cpu-high-performance.ps1 | iex
 ```
 
 When it starts, it prompts you to choose:
