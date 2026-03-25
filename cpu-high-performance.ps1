@@ -132,24 +132,21 @@ function Convert-HexIndexToDecimal {
     return [int][Convert]::ToUInt32($Value.Replace('0x', ''), 16)
 }
 
-function Get-IndexValueFromLines {
-    param(
-        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Lines,
-        [Parameter(Mandatory)][string[]]$Markers
-    )
+function Get-CurrentIndicesFromText {
+    param([Parameter(Mandatory)][string]$Text)
 
-    foreach ($line in $Lines) {
-        foreach ($marker in $Markers) {
-            if ($line -like "*$marker*") {
-                $match = [regex]::Match($line, '0x[0-9A-Fa-f]+')
-                if ($match.Success) {
-                    return Convert-HexIndexToDecimal -Value $match.Value
-                }
-            }
-        }
+    $matches = [regex]::Matches($Text, '0x[0-9A-Fa-f]+')
+    if ($matches.Count -lt 2) {
+        throw 'Unable to extract current AC/DC power setting indices from powercfg output.'
     }
 
-    throw 'Unable to extract a power setting index from powercfg output.'
+    $acHexValue = $matches[$matches.Count - 2].Value
+    $dcHexValue = $matches[$matches.Count - 1].Value
+
+    return [ordered]@{
+        Ac = Convert-HexIndexToDecimal -Value $acHexValue
+        Dc = Convert-HexIndexToDecimal -Value $dcHexValue
+    }
 }
 
 function Get-SettingValuePair {
@@ -164,14 +161,7 @@ function Get-SettingValuePair {
         throw "powercfg /q returned no output for scheme '$SchemeGuid', subgroup '$SubgroupGuid', setting '$SettingGuid'."
     }
 
-    $lines = ($text -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    $currentAcMarkerZh = New-UnicodeString -CodePoints @(0x5F53,0x524D,0x4EA4,0x6D41,0x7535,0x6E90,0x8BBE,0x7F6E,0x7D22,0x5F15)
-    $currentDcMarkerZh = New-UnicodeString -CodePoints @(0x5F53,0x524D,0x76F4,0x6D41,0x7535,0x6E90,0x8BBE,0x7F6E,0x7D22,0x5F15)
-
-    return [ordered]@{
-        Ac = Get-IndexValueFromLines -Lines $lines -Markers @('Current AC Power Setting Index', $currentAcMarkerZh)
-        Dc = Get-IndexValueFromLines -Lines $lines -Markers @('Current DC Power Setting Index', $currentDcMarkerZh)
-    }
+    return Get-CurrentIndicesFromText -Text $text
 }
 
 function Get-HeterogeneousDisplayNames {
