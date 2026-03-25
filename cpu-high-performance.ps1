@@ -11,6 +11,30 @@ function Write-WarnMsg($msg) { Write-Host "[警告] $msg" -ForegroundColor Yello
 function Write-Skip($msg)    { Write-Host "[跳过] $msg" -ForegroundColor DarkYellow }
 function Write-Err($msg)     { Write-Host "[错误] $msg" -ForegroundColor Red }
 
+function Get-ExecutionPaths {
+    $outputDir = (Get-Location).Path
+    $launchFile = $null
+
+    if ($PSCommandPath) {
+        $launchFile = $PSCommandPath
+        $outputDir = Split-Path -Parent $PSCommandPath
+    }
+    elseif ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.ScriptBlock) {
+        $selfText = $MyInvocation.MyCommand.ScriptBlock.ToString()
+        if ($selfText) {
+            $launchFile = Join-Path $env:TEMP 'cpu-high-performance.ps1'
+            Set-Content -LiteralPath $launchFile -Value $selfText -Encoding UTF8 -Force
+        }
+    }
+
+    [pscustomobject]@{
+        LaunchFile = $launchFile
+        OutputDir  = $outputDir
+    }
+}
+
+$script:Paths = Get-ExecutionPaths
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
@@ -18,28 +42,34 @@ function Test-Admin {
 }
 
 function Restart-Elevated {
+    if (-not $script:Paths.LaunchFile) {
+        throw "无法确定脚本路径。请改用“先下载再执行”的方式运行此脚本。"
+    }
+
     $argList = @(
         '-NoProfile'
         '-ExecutionPolicy', 'Bypass'
-        '-File', "`"$PSCommandPath`""
+        '-File', "`"$($script:Paths.LaunchFile)`""
     )
-    Start-Process powershell -Verb RunAs -ArgumentList $argList
+
+    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
     exit
 }
 
 function Get-OsInfo {
     $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     [pscustomobject]@{
-        ProductName = $cv.ProductName
-        CurrentVersion = $cv.CurrentVersion
+        ProductName        = $cv.ProductName
+        CurrentVersion     = $cv.CurrentVersion
         CurrentBuildNumber = [int]$cv.CurrentBuildNumber
-        DisplayVersion = $cv.DisplayVersion
+        DisplayVersion     = $cv.DisplayVersion
     }
 }
 
 function Invoke-PowerCfg {
     param(
-        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
         [switch]$IgnoreError
     )
 
@@ -52,13 +82,14 @@ function Invoke-PowerCfg {
 
     [pscustomobject]@{
         ExitCode = $code
-        Output = ($output | Out-String).Trim()
+        Output   = ($output | Out-String).Trim()
     }
 }
 
 function Test-PowerCfgSetting {
     param(
-        [Parameter(Mandatory=$true)][string]$Alias
+        [Parameter(Mandatory = $true)]
+        [string]$Alias
     )
 
     $r = Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR', $Alias) -IgnoreError
@@ -90,7 +121,6 @@ try {
     }
 
     $supportPowerThrottling = $os.CurrentBuildNumber -ge 16299
-    $supportHeteroDoc = $true
 
     Write-Info "步骤 1/6：检查“关闭电源节流”支持情况"
     if ($supportPowerThrottling) {
@@ -112,7 +142,8 @@ try {
     try {
         Invoke-PowerCfg -Arguments @('/restoredefaultschemes') | Out-Null
         Write-Ok "已恢复默认电源方案"
-    } catch {
+    }
+    catch {
         Write-WarnMsg $_.Exception.Message
     }
 
@@ -121,13 +152,14 @@ try {
     try {
         Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_MIN') | Out-Null
         Write-Ok "当前已切换到“高性能”"
-    } catch {
+    }
+    catch {
         Write-WarnMsg "切换到高性能电源方案失败，继续执行后续步骤。"
     }
 
     Write-Host ""
     Write-Info "步骤 4/6：导出当前处理器电源设置到 a.txt"
-    $txtPath = Join-Path $PSScriptRoot 'a.txt'
+    $txtPath = Join-Path $script:Paths.OutputDir 'a.txt'
     try {
         $q1 = Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR')
         $q2 = Invoke-PowerCfg -Arguments @('/qh')
@@ -135,44 +167,42 @@ try {
             $q1.Output
             ""
             $q2.Output
-        ) | Set-Content -Path $txtPath -Encoding UTF8
+        ) | Set-Content -LiteralPath $txtPath -Encoding UTF8
         Write-Ok "已生成 $txtPath"
-    } catch {
+    }
+    catch {
         Write-WarnMsg "导出电源设置失败：$($_.Exception.Message)"
     }
 
     Write-Host ""
     Write-Info "步骤 5/6：检查异类线程调度策略支持情况"
 
-    $hasSchedPolicy = $false
-    $hasShortSchedPolicy = $false
+    $hasSchedPolicy = Test-PowerCfgSetting -Alias 'SCHEDPOLICY'
+    $hasShortSchedPolicy = Test-PowerCfgSetting -Alias 'SHORTSCHEDPOLICY'
 
-    if ($supportHeteroDoc) {
-        $hasSchedPolicy = Test-PowerCfgSetting -Alias 'SCHEDPOLICY'
-        $hasShortSchedPolicy = Test-PowerCfgSetting -Alias 'SHORTSCHEDPOLICY'
-
-        if ($hasSchedPolicy) {
-            Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
-            Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
-            Write-Ok "SCHEDPOLICY 已设置为“首选高性能处理器”"
-        } else {
-            Write-Skip "当前系统/CPU 未暴露 SCHEDPOLICY"
-        }
-
-        if ($hasShortSchedPolicy) {
-            Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
-            Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
-            Write-Ok "SHORTSCHEDPOLICY 已设置为“首选高性能处理器”"
-        } else {
-            Write-Skip "当前系统/CPU 未暴露 SHORTSCHEDPOLICY"
-        }
-
-        if (-not $hasSchedPolicy -and -not $hasShortSchedPolicy) {
-            Write-WarnMsg "该机器虽然是受支持的 Windows 10/11，但当前平台没有暴露异类线程调度策略。常见原因是非混合架构 CPU，或固件/平台未提供这些设置。"
-        }
-
-        Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_CURRENT') -IgnoreError | Out-Null
+    if ($hasSchedPolicy) {
+        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
+        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
+        Write-Ok "SCHEDPOLICY 已设置为“首选高性能处理器”"
     }
+    else {
+        Write-Skip "当前系统/CPU 未暴露 SCHEDPOLICY"
+    }
+
+    if ($hasShortSchedPolicy) {
+        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
+        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
+        Write-Ok "SHORTSCHEDPOLICY 已设置为“首选高性能处理器”"
+    }
+    else {
+        Write-Skip "当前系统/CPU 未暴露 SHORTSCHEDPOLICY"
+    }
+
+    if (-not $hasSchedPolicy -and -not $hasShortSchedPolicy) {
+        Write-WarnMsg "该机器虽然是受支持的 Windows 10/11，但当前平台没有暴露异类线程调度策略。常见原因是非混合架构 CPU，或固件/平台未提供这些设置。"
+    }
+
+    Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_CURRENT') -IgnoreError | Out-Null
 
     Write-Host ""
     Write-Info "步骤 6/6：输出当前状态"
@@ -181,7 +211,8 @@ try {
         $reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -ErrorAction Stop
         Write-Host "---------- Power Throttling ----------"
         Write-Host "PowerThrottlingOff = $($reg.PowerThrottlingOff)"
-    } catch {
+    }
+    catch {
         Write-WarnMsg "无法读取 PowerThrottlingOff"
     }
 
@@ -200,7 +231,6 @@ try {
     Write-Host "[说明] 异类线程调度策略仅在系统实际提供该设置时才会应用"
     Write-Host "[说明] “首选高性能处理器” 对应值为 2"
     Write-Host "[说明] 建议执行后重启一次系统"
-
 }
 catch {
     Write-Err $_.Exception.Message
