@@ -86,14 +86,50 @@ function Invoke-PowerCfg {
     }
 }
 
-function Test-PowerCfgSetting {
+function Find-GuidInLinesByNames {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Alias
+        [string[]]$Lines,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$CandidateNames
     )
 
-    $r = Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR', $Alias) -IgnoreError
-    return ($r.ExitCode -eq 0)
+    $guidPattern = '(?i)\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b'
+
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = [string]$Lines[$i]
+        $matchedName = $false
+
+        foreach ($name in $CandidateNames) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+            if ($line.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $matchedName = $true
+                break
+            }
+        }
+
+        if (-not $matchedName) { continue }
+
+        $m = [regex]::Match($line, $guidPattern)
+        if ($m.Success) {
+            return $m.Value.ToLowerInvariant()
+        }
+
+        $start = [Math]::Max(0, $i - 3)
+        $end   = [Math]::Min($Lines.Count - 1, $i + 3)
+
+        for ($j = $start; $j -le $end; $j++) {
+            $nearLine = [string]$Lines[$j]
+            $nearMatch = [regex]::Match($nearLine, $guidPattern)
+            if ($nearMatch.Success) {
+                return $nearMatch.Value.ToLowerInvariant()
+            }
+        }
+    }
+
+    return $null
 }
 
 try {
@@ -122,7 +158,7 @@ try {
 
     $supportPowerThrottling = $os.CurrentBuildNumber -ge 16299
 
-    Write-Info "步骤 1/6：检查关闭电源节流支持情况"
+    Write-Info "步骤 1/7：检查关闭电源节流支持情况"
     if ($supportPowerThrottling) {
         New-Item -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -Force | Out-Null
         New-ItemProperty `
@@ -138,7 +174,7 @@ try {
     }
 
     Write-Host ""
-    Write-Info "步骤 2/6：恢复默认电源方案"
+    Write-Info "步骤 2/7：恢复默认电源方案"
     try {
         Invoke-PowerCfg -Arguments @('/restoredefaultschemes') | Out-Null
         Write-Ok "已恢复默认电源方案"
@@ -148,7 +184,7 @@ try {
     }
 
     Write-Host ""
-    Write-Info "步骤 3/6：切换到高性能电源方案"
+    Write-Info "步骤 3/7：切换到高性能电源方案"
     try {
         Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_MIN') | Out-Null
         Write-Ok "当前已切换到高性能"
@@ -158,16 +194,22 @@ try {
     }
 
     Write-Host ""
-    Write-Info "步骤 4/6：导出当前处理器电源设置到 a.txt"
+    Write-Info "步骤 4/7：导出当前处理器电源设置到 a.txt"
     $txtPath = Join-Path $script:Paths.OutputDir 'a.txt'
     try {
         $q1 = Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR')
         $q2 = Invoke-PowerCfg -Arguments @('/qh')
+
         @(
             $q1.Output
             ""
+            "===================="
+            "FULL HIDDEN SETTINGS"
+            "===================="
+            ""
             $q2.Output
         ) | Set-Content -LiteralPath $txtPath -Encoding UTF8
+
         Write-Ok "已生成 $txtPath"
     }
     catch {
@@ -175,61 +217,114 @@ try {
     }
 
     Write-Host ""
-    Write-Info "步骤 5/6：检查异类线程调度策略支持情况"
+    Write-Info "步骤 5/7：从 a.txt 中搜索对应 GUID"
 
-    $hasSchedPolicy = Test-PowerCfgSetting -Alias 'SCHEDPOLICY'
-    $hasShortSchedPolicy = Test-PowerCfgSetting -Alias 'SHORTSCHEDPOLICY'
+    $lines = Get-Content -LiteralPath $txtPath -ErrorAction Stop
 
-    if ($hasSchedPolicy) {
-        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
-        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY', '2') | Out-Null
-        Write-Ok "SCHEDPOLICY 已设置为首选高性能处理器"
+    $processorSubgroupGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
+        'Processor power management',
+        '处理器电源管理'
+    )
+
+    $schedPolicyGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
+        'Heterogeneous thread scheduling policy',
+        '异类线程调度策略'
+    )
+
+    $shortSchedPolicyGuid = Find-GuidInLinesByNames -Lines $lines -CandidateNames @(
+        'Heterogeneous short running thread scheduling policy',
+        '异类短运行线程调度策略'
+    )
+
+    if ($processorSubgroupGuid) {
+        Write-Ok "已从 a.txt 识别处理器子组 GUID: $processorSubgroupGuid"
     }
     else {
-        Write-Skip "当前系统或 CPU 未暴露 SCHEDPOLICY"
+        Write-WarnMsg "未能从 a.txt 识别处理器电源管理子组 GUID"
     }
 
-    if ($hasShortSchedPolicy) {
-        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
-        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY', '2') | Out-Null
-        Write-Ok "SHORTSCHEDPOLICY 已设置为首选高性能处理器"
+    if ($schedPolicyGuid) {
+        Write-Ok "已从 a.txt 识别异类线程调度策略 GUID: $schedPolicyGuid"
     }
     else {
-        Write-Skip "当前系统或 CPU 未暴露 SHORTSCHEDPOLICY"
+        Write-WarnMsg "未能从 a.txt 识别异类线程调度策略 GUID"
     }
 
-    if (-not $hasSchedPolicy -and -not $hasShortSchedPolicy) {
-        Write-WarnMsg "该机器虽然是受支持的 Windows 10 或 11，但当前平台没有暴露异类线程调度策略。常见原因是非混合架构 CPU，或固件、平台未提供这些设置。"
+    if ($shortSchedPolicyGuid) {
+        Write-Ok "已从 a.txt 识别异类短运行线程调度策略 GUID: $shortSchedPolicyGuid"
+    }
+    else {
+        Write-WarnMsg "未能从 a.txt 识别异类短运行线程调度策略 GUID"
+    }
+
+    Write-Host ""
+    Write-Info "步骤 6/7：取消隐藏对应电源选项"
+
+    if ($processorSubgroupGuid -and $schedPolicyGuid) {
+        Invoke-PowerCfg -Arguments @('-attributes', $processorSubgroupGuid, $schedPolicyGuid, '-ATTRIB_HIDE') -IgnoreError | Out-Null
+        Write-Ok "已取消隐藏异类线程调度策略"
+    }
+    else {
+        Write-Skip "由于未找到对应 GUID，跳过取消隐藏异类线程调度策略"
+    }
+
+    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
+        Invoke-PowerCfg -Arguments @('-attributes', $processorSubgroupGuid, $shortSchedPolicyGuid, '-ATTRIB_HIDE') -IgnoreError | Out-Null
+        Write-Ok "已取消隐藏异类短运行线程调度策略"
+    }
+    else {
+        Write-Skip "由于未找到对应 GUID，跳过取消隐藏异类短运行线程调度策略"
+    }
+
+    Write-Host ""
+    Write-Info "步骤 7/7：写入高性能相关设置"
+
+    if ($processorSubgroupGuid -and $schedPolicyGuid) {
+        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid, '2') | Out-Null
+        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid, '2') | Out-Null
+        Write-Ok "异类线程调度策略已设置为首选高性能处理器"
+    }
+    else {
+        Write-Skip "由于未找到对应 GUID，跳过设置异类线程调度策略"
+    }
+
+    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
+        Invoke-PowerCfg -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid, '2') | Out-Null
+        Invoke-PowerCfg -Arguments @('/setdcvalueindex', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid, '2') | Out-Null
+        Write-Ok "异类短运行线程调度策略已设置为首选高性能处理器"
+    }
+    else {
+        Write-Skip "由于未找到对应 GUID，跳过设置异类短运行线程调度策略"
     }
 
     Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_CURRENT') -IgnoreError | Out-Null
 
     Write-Host ""
-    Write-Info "步骤 6/6：输出当前状态"
+    Write-Host "---------- 当前状态 ----------"
 
     try {
         $reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' -ErrorAction Stop
-        Write-Host "---------- Power Throttling ----------"
         Write-Host "PowerThrottlingOff = $($reg.PowerThrottlingOff)"
     }
     catch {
         Write-WarnMsg "无法读取 PowerThrottlingOff"
     }
 
-    if ($hasSchedPolicy) {
-        Write-Host "---------- SCHEDPOLICY ----------"
-        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SCHEDPOLICY')).Output | Write-Host
+    if ($processorSubgroupGuid -and $schedPolicyGuid) {
+        Write-Host "---------- SCHED POLICY ----------"
+        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', $processorSubgroupGuid, $schedPolicyGuid)).Output | Write-Host
     }
 
-    if ($hasShortSchedPolicy) {
-        Write-Host "---------- SHORTSCHEDPOLICY ----------"
-        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', 'SUB_PROCESSOR', 'SHORTSCHEDPOLICY')).Output | Write-Host
+    if ($processorSubgroupGuid -and $shortSchedPolicyGuid) {
+        Write-Host "---------- SHORT SCHED POLICY ----------"
+        (Invoke-PowerCfg -Arguments @('/query', 'SCHEME_CURRENT', $processorSubgroupGuid, $shortSchedPolicyGuid)).Output | Write-Host
     }
 
     Write-Host ""
     Write-Host "[说明] 关闭电源节流仅适用于 Windows 10 1709+ / Windows 11"
-    Write-Host "[说明] 异类线程调度策略仅在系统实际提供该设置时才会应用"
     Write-Host "[说明] 首选高性能处理器 对应值为 2"
+    Write-Host "[说明] 本脚本按你的要求，从 a.txt 中搜索名称并提取对应 GUID"
+    Write-Host "[说明] 如果你的系统翻译不同，请调整脚本中的 CandidateNames"
     Write-Host "[说明] 建议执行后重启一次系统"
 }
 catch {
