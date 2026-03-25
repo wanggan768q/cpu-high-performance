@@ -39,7 +39,7 @@ function Test-Admin {
 
 function Restart-Elevated {
     if (-not $script:Paths.LaunchFile) {
-        throw "无法确定脚本路径。请改用“先下载再执行”的方式运行此脚本。"
+        throw "无法确定脚本路径。请改用先下载再执行的方式运行此脚本。"
     }
 
     Start-Process powershell.exe -Verb RunAs -ArgumentList @(
@@ -96,7 +96,7 @@ try {
     Write-Host ""
     Write-Info "步骤 3/3：切换到平衡模式"
     Invoke-PowerCfg -Arguments @('/setactive', 'SCHEME_BALANCED') | Out-Null
-    Write-Ok "当前已切换到“平衡”电源方案"
+    Write-Ok "当前已切换到平衡电源方案"
 
     Write-Host ""
     Write-Host "---------- 当前状态 ----------"
@@ -110,6 +110,7 @@ try {
 
     Write-Host ""
     Write-Host "[说明] 已恢复默认设置，建议重启一次系统。"
+    Write-Host "[说明] restoredefaultschemes 会重置电源方案，并删除自定义电源计划。"
 }
 catch {
     Write-Err $_.Exception.Message
