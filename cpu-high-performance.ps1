@@ -132,20 +132,72 @@ function Convert-HexIndexToDecimal {
     return [int][Convert]::ToUInt32($Value.Replace('0x', ''), 16)
 }
 
+function Convert-PowerCfgIndexValueToDecimal {
+    param([Parameter(Mandatory)][string]$Value)
+
+    $normalizedValue = $Value.Trim()
+    if ($normalizedValue -match '^0x[0-9A-Fa-f]+$') {
+        return Convert-HexIndexToDecimal -Value $normalizedValue
+    }
+
+    if ($normalizedValue -match '^\d+$') {
+        return [int]$normalizedValue
+    }
+
+    throw "Unsupported power setting index format '$Value'."
+}
+
+function Get-TrailingPowerCfgIndexCandidates {
+    param(
+        [Parameter(Mandatory)][string[]]$Lines,
+        [Parameter(Mandatory)][int]$TailWindowSize
+    )
+
+    $tailLines = @($Lines | Select-Object -Last $TailWindowSize)
+    $capturedValues = New-Object System.Collections.Generic.List[string]
+
+    for ($index = $tailLines.Count - 1; $index -ge 0; $index--) {
+        $line = $tailLines[$index]
+        $match = [regex]::Match($line, '(0x[0-9A-Fa-f]+|\d+)\s*$')
+        if ($match.Success) {
+            $capturedValues.Insert(0, $match.Value)
+            if ($capturedValues.Count -eq 2) {
+                break
+            }
+        }
+    }
+
+    return [ordered]@{
+        Values = @($capturedValues)
+        TailLines = $tailLines
+    }
+}
+
 function Get-CurrentIndicesFromText {
     param([Parameter(Mandatory)][string]$Text)
 
-    $matches = [regex]::Matches($Text, '0x[0-9A-Fa-f]+')
-    if ($matches.Count -lt 2) {
-        throw 'Unable to extract current AC/DC power setting indices from powercfg output.'
+    $lines = ($Text -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $searchWindows = @(4, 8)
+    $tailLines = @()
+    $capturedValues = @()
+
+    foreach ($windowSize in $searchWindows) {
+        $result = Get-TrailingPowerCfgIndexCandidates -Lines $lines -TailWindowSize $windowSize
+        $tailLines = $result.TailLines
+        $capturedValues = $result.Values
+        if ($capturedValues.Count -eq 2) {
+            break
+        }
     }
 
-    $acHexValue = $matches[$matches.Count - 2].Value
-    $dcHexValue = $matches[$matches.Count - 1].Value
+    if ($capturedValues.Count -lt 2) {
+        $candidateText = if ($capturedValues.Count -gt 0) { $capturedValues -join ', ' } else { '<none>' }
+        throw ("Unable to extract current AC/DC power setting indices from powercfg output. Candidate tokens: {0}. Tail lines: {1}" -f $candidateText, ($tailLines -join ' || '))
+    }
 
     return [ordered]@{
-        Ac = Convert-HexIndexToDecimal -Value $acHexValue
-        Dc = Convert-HexIndexToDecimal -Value $dcHexValue
+        Ac = Convert-PowerCfgIndexValueToDecimal -Value $capturedValues[0]
+        Dc = Convert-PowerCfgIndexValueToDecimal -Value $capturedValues[1]
     }
 }
 
