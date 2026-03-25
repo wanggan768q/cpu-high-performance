@@ -5,10 +5,31 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-function Write-Info($msg) { Write-Host "[信息] $msg" -ForegroundColor Cyan }
-function Write-Ok($msg)   { Write-Host "[完成] $msg" -ForegroundColor Green }
+function Write-Info($msg)    { Write-Host "[信息] $msg" -ForegroundColor Cyan }
+function Write-Ok($msg)      { Write-Host "[完成] $msg" -ForegroundColor Green }
 function Write-WarnMsg($msg) { Write-Host "[警告] $msg" -ForegroundColor Yellow }
-function Write-Err($msg)  { Write-Host "[错误] $msg" -ForegroundColor Red }
+function Write-Err($msg)     { Write-Host "[错误] $msg" -ForegroundColor Red }
+
+function Get-ExecutionPaths {
+    $launchFile = $null
+
+    if ($PSCommandPath) {
+        $launchFile = $PSCommandPath
+    }
+    elseif ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.ScriptBlock) {
+        $selfText = $MyInvocation.MyCommand.ScriptBlock.ToString()
+        if ($selfText) {
+            $launchFile = Join-Path $env:TEMP 'restore-default.ps1'
+            Set-Content -LiteralPath $launchFile -Value $selfText -Encoding UTF8 -Force
+        }
+    }
+
+    [pscustomobject]@{
+        LaunchFile = $launchFile
+    }
+}
+
+$script:Paths = Get-ExecutionPaths
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -17,15 +38,14 @@ function Test-Admin {
 }
 
 function Restart-Elevated {
-    $currentPath = $PSCommandPath
-    if (-not $currentPath) {
-        throw "请先将脚本保存为 .ps1 文件后再运行；当前执行方式无法自动提权。"
+    if (-not $script:Paths.LaunchFile) {
+        throw "无法确定脚本路径。请改用“先下载再执行”的方式运行此脚本。"
     }
 
-    Start-Process powershell -Verb RunAs -ArgumentList @(
+    Start-Process powershell.exe -Verb RunAs -ArgumentList @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
-        '-File', "`"$currentPath`""
+        '-File', "`"$($script:Paths.LaunchFile)`""
     )
     exit
 }
@@ -83,13 +103,13 @@ try {
     try {
         $active = Invoke-PowerCfg -Arguments @('/getactivescheme')
         Write-Host $active
-    } catch {
+    }
+    catch {
         Write-WarnMsg "无法读取当前活动电源方案"
     }
 
     Write-Host ""
-    Write-Host "[说明] 已恢复默认设置。建议重启一次系统。"
-
+    Write-Host "[说明] 已恢复默认设置，建议重启一次系统。"
 }
 catch {
     Write-Err $_.Exception.Message
