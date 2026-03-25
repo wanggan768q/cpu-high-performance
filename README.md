@@ -8,7 +8,7 @@ irm https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/head
 
 ## 更安全的方式
 ```
-$u = "https://raw.githubusercontent.com/<user>/<repo>/<branch>/cpu-high-performance.ps1"
+$u = "https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/heads/main/cpu-high-performance.ps1"
 $f = Join-Path $env:TEMP "cpu-high-performance.ps1"
 iwr $u -OutFile $f
 powershell -ExecutionPolicy Bypass -File $f
