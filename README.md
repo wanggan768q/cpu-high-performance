@@ -94,3 +94,6 @@ Restores the following:
 
 ```powershell
 irm https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/heads/main/cpu-high-performance.ps1 | iex
+
+irm https://raw.githubusercontent.com/wanggan768q/cpu-high-performance/refs/heads/main/restore-default.ps1 | iex
+
