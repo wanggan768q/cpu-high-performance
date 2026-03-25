@@ -201,6 +201,64 @@ function Get-CurrentIndicesFromText {
     }
 }
 
+function Get-SettingBlockFromSubgroupText {
+    param(
+        [Parameter(Mandatory)][string]$SubgroupText,
+        [Parameter(Mandatory)][string]$SettingGuid
+    )
+
+    $lines = $SubgroupText -split "`r?`n"
+    $normalizedSettingGuid = $SettingGuid.ToLowerInvariant()
+    $capturedLines = New-Object System.Collections.Generic.List[string]
+    $capturing = $false
+
+    foreach ($line in $lines) {
+        $lowerLine = $line.ToLowerInvariant()
+
+        if ($lowerLine -match '^[\s　]*(电源设置 guid|power setting guid)\s*[:：]') {
+            if ($capturing) {
+                break
+            }
+
+            if ($lowerLine -like "*$normalizedSettingGuid*") {
+                $capturing = $true
+                $capturedLines.Add($line)
+                continue
+            }
+        }
+
+        if ($capturing) {
+            $capturedLines.Add($line)
+        }
+    }
+
+    if ($capturedLines.Count -eq 0) {
+        throw "Unable to find setting GUID '$SettingGuid' inside subgroup powercfg output."
+    }
+
+    return ($capturedLines -join [Environment]::NewLine)
+}
+
+function Get-SettingQueryText {
+    param(
+        [Parameter(Mandatory)][string]$SchemeGuid,
+        [Parameter(Mandatory)][string]$SubgroupGuid,
+        [Parameter(Mandatory)][string]$SettingGuid
+    )
+
+    $settingText = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid, $SettingGuid)
+    if (-not [string]::IsNullOrWhiteSpace($settingText) -and $settingText.ToLowerInvariant().Contains($SettingGuid.ToLowerInvariant())) {
+        return $settingText
+    }
+
+    $subgroupText = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid)
+    if ([string]::IsNullOrWhiteSpace($subgroupText)) {
+        throw "powercfg /q returned no output for scheme '$SchemeGuid' and subgroup '$SubgroupGuid'."
+    }
+
+    return Get-SettingBlockFromSubgroupText -SubgroupText $subgroupText -SettingGuid $SettingGuid
+}
+
 function Get-SettingValuePair {
     param(
         [Parameter(Mandatory)][string]$SchemeGuid,
@@ -208,7 +266,7 @@ function Get-SettingValuePair {
         [Parameter(Mandatory)][string]$SettingGuid
     )
 
-    $text = Invoke-PowerCfgQuery -Arguments @('/q', $SchemeGuid, $SubgroupGuid, $SettingGuid)
+    $text = Get-SettingQueryText -SchemeGuid $SchemeGuid -SubgroupGuid $SubgroupGuid -SettingGuid $SettingGuid
     if ([string]::IsNullOrWhiteSpace($text)) {
         throw "powercfg /q returned no output for scheme '$SchemeGuid', subgroup '$SubgroupGuid', setting '$SettingGuid'."
     }
